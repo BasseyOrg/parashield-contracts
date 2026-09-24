@@ -16,6 +16,10 @@
 //! (e.g., "rainfall < 50mm"). Therefore this contract acts as the
 //! escrow: it holds USDC and the Claims Processor calls `token.transfer`
 //! to pay the policyholder when the oracle confirms a trigger.
+// Address/state validation must fail with a typed contract error so callers
+// can match on it programmatically, never with a raw panic! and a string
+// message.
+#![deny(clippy::panic)]
 #![no_std]
 extern crate alloc;
 
@@ -31,14 +35,8 @@ pub use types::*;
 
 // ─── Storage TTL ──────────────────────────────────────────────────────────────
 
-/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
-/// (at ~5s/ledger).
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
-const TTL_THRESHOLD: u32 = 518_400;
-/// Extend persistent entries out to ~1 year (at ~5s/ledger) so long-lived
-/// products and policies don't get evicted from storage before they mature.
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
-const TTL_EXTEND_TO: u32 = 6_312_000;
+// Shared protocol constants — single source of truth in parashield-common (issue #342).
+use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK};
 const DEFAULT_MAX_PRODUCTS_PER_POOL: u32 = 100;
 const CURRENT_STORAGE_VERSION: u32 = 3;
 
@@ -65,6 +63,9 @@ enum StorageKey {
     /// Maps (category, oracle_key) -> product_id for uniqueness constraint
     ProductKey((Symbol, Symbol)),
     PendingAdmin,
+    /// Ledger timestamp (u64) at which `PendingAdmin` was set, used to enforce
+    /// `ADMIN_TRANSFER_TIMELOCK` before `accept_admin` succeeds (issue #356).
+    PendingAdminSince,
     MaxProductsPerPool,
     PoolProductCount(Symbol),
     /// Contract version (u32) for storage migration tracking
@@ -100,6 +101,9 @@ pub enum Error {
     Overflow = 21,
     TooManyProducts = 22,
     InvalidMaxProducts = 23,
+    AdminTimelockNotExpired = 24,
+    InvalidAddress = 25,
+    InvalidVersion = 26,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -120,46 +124,35 @@ impl PolicyEngine {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
-        // require_auth() validates all addresses at the protocol level, so we
-        // do not need manual address format validation here.
+
         let admin_str = admin.to_string();
-        //
-        if false {
-            panic!("invalid address: admin must be an account address");
-        }
         if admin_str.len() != 56 {
-            panic!("invalid address: admin must be an account or contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
         let mut admin_buf = [0u8; 56];
         admin_str.copy_into_slice(&mut admin_buf);
         if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
-            panic!("invalid address: admin must be an account or contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
 
         let usdc_str = usdc_token.to_string();
-        let oracle_str = oracle_address.to_string();
-        //
-        //
-        if false {
-            panic!("invalid address: usdc_token must be a contract address");
-        }
         if usdc_str.len() != 56 {
-            panic!("invalid address: usdc_token must be a contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
         let mut usdc_buf = [0u8; 56];
         usdc_str.copy_into_slice(&mut usdc_buf);
         if usdc_buf[0] != b'C' {
-            panic!("invalid address: usdc_token must be a contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
 
         let oracle_str = oracle_address.to_string();
         if oracle_str.len() != 56 {
-            panic!("invalid address: oracle_address must be a contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
         let mut oracle_buf = [0u8; 56];
         oracle_str.copy_into_slice(&mut oracle_buf);
         if oracle_buf[0] != b'C' {
-            panic!("invalid address: oracle_address must be a contract address");
+            panic_with_error!(&env, Error::InvalidAddress);
         }
 
         let balance_res = env.try_invoke_contract::<i128, soroban_sdk::Error>(
@@ -779,13 +772,18 @@ impl PolicyEngine {
     /// Propose a new admin. Only the current admin can call this.
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
-        // Store the proposed admin
+        // Store the proposed admin and arm the timelock (issue #356).
         env.storage()
             .instance()
             .set(&StorageKey::PendingAdmin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
     }
 
-    /// Accept the proposed admin. Only the proposed admin can call this.
+    /// Accept the proposed admin. Only the proposed admin can call this, and
+    /// only once `ADMIN_TRANSFER_TIMELOCK` has elapsed since the transfer was
+    /// proposed (issue #356).
     pub fn accept_admin(env: Env, admin: Address) {
         let pending_admin: Address = env
             .storage()
@@ -797,15 +795,16 @@ impl PolicyEngine {
             panic_with_error!(&env, Error::Unauthorized);
         }
         admin.require_auth();
-        let _current_admin: Address = env
-            .storage()
-            .instance()
-            .get(&StorageKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        let since: u64 = env.storage().instance()
+            .get(&StorageKey::PendingAdminSince).unwrap_or(0);
+        if env.ledger().timestamp() < since.saturating_add(ADMIN_TRANSFER_TIMELOCK) {
+            panic_with_error!(&env, Error::AdminTimelockNotExpired);
+        }
         // Update admin
         env.storage().instance().set(&StorageKey::Admin, &admin);
         // Clear the proposal
         env.storage().instance().remove(&StorageKey::PendingAdmin);
+        env.storage().instance().remove(&StorageKey::PendingAdminSince);
         // Emit event
         env.events().publish(
             (Symbol::new(&env, "admin_updated"),),
@@ -922,7 +921,7 @@ impl PolicyEngine {
             .get(&StorageKey::Version)
             .unwrap_or(1);
         if new_version <= current_version {
-            panic!("new version must be greater than current version");
+            panic_with_error!(&env, Error::InvalidVersion);
         }
 
         // Run migrations from current_version to new_version
@@ -949,7 +948,7 @@ impl PolicyEngine {
     /// Each migration function handles a specific version transition.
     fn run_migrations(env: &Env, old_version: u32, new_version: u32) {
         if old_version == 0 || new_version <= old_version || new_version > CURRENT_STORAGE_VERSION {
-            panic!("invalid migration version");
+            panic_with_error!(env, Error::InvalidVersion);
         }
 
         let mut version = old_version;
@@ -963,7 +962,7 @@ impl PolicyEngine {
                     Self::migrate_v2_to_v3(env);
                     version = 3;
                 }
-                _ => panic!("unsupported migration path"),
+                _ => panic_with_error!(env, Error::InvalidVersion),
             }
         }
     }
