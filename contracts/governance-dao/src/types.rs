@@ -499,3 +499,49 @@ pub struct ProposalCommentAdded {
     pub reply_to: Option<u128>,
     pub created_at: u64,
 }
+
+// ─── Impact-based proposal threshold escalation (issue #438) ────────────────
+
+/// Escalation multipliers applied on top of `DaoConfig.proposal_threshold`
+/// based on the impact of the proposal. Stored separately from `DaoConfig`
+/// so an existing DAO's stored config layout is untouched until an admin
+/// opts in via `set_impact_multipliers`.
+///
+/// Multipliers are in basis points where 10_000 = 1x. All three fields must
+/// be at least 10_000 (`MIN_MULTIPLIER_BPS`): the goal is to raise the bar
+/// for high-impact proposals, never to lower it below the configured base.
+///
+/// Selection rule (see `effective_threshold`):
+///   1. `Upgrade` proposals always use `upgrade_bps`.
+///   2. `Standard` proposals targeting the DAO's own address use
+///      `self_target_bps`.
+///   3. All other `Standard` proposals use `standard_bps`.
+///
+/// When the storage key is absent, the contract behaves as `standard_bps =
+/// upgrade_bps = self_target_bps = 10_000` (1x, matches historical
+/// behaviour).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImpactMultipliers {
+    /// Multiplier for `Standard` proposals whose target is not the DAO.
+    /// 10_000 = 1x (default).
+    pub standard_bps: u32,
+    /// Multiplier for `Upgrade` proposals. Contract-code replacement is the
+    /// highest-impact governance action; the shipped default of 5x forces a
+    /// materially larger deposit than a routine parameter tweak.
+    pub upgrade_bps: u32,
+    /// Multiplier for `Standard` proposals whose target address is the DAO
+    /// contract itself (a proposal that mutates governance state directly,
+    /// e.g. `update_config`). Set higher than `standard_bps` so a proposer
+    /// cannot bypass upgrade-tier gating by wrapping a self-mutation in a
+    /// Standard call.
+    pub self_target_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImpactMultipliersUpdated {
+    pub standard_bps: u32,
+    pub upgrade_bps: u32,
+    pub self_target_bps: u32,
+}
