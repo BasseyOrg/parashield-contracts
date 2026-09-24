@@ -188,6 +188,9 @@ pub enum Error {
     InvalidOutlierConfig = 27,
     InvalidInput = 28,
     CrossValidationFailed = 29,
+    /// An admin transfer was proposed while another one is still pending,
+    /// which would reset the transfer timelock (issue #457).
+    AdminTransferPending = 30,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -430,9 +433,25 @@ impl OracleVerifier {
     /// guardians to call `approve_admin_change` first, guarding this
     /// takeover-capable operation against a single compromised admin key.
     /// With no guardians configured (default), behavior is unchanged.
+    ///
+    /// Panics with `AdminTransferPending` while a transfer is already armed:
+    /// re-proposing over an armed transfer would rewrite `PendingAdminSince`
+    /// and reset the `ADMIN_TRANSFER_TIMELOCK` (issue #457).
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
         Self::validate_stellar_address(&env, &new_admin);
+
+        // Issue #457: reject a fresh proposal while one is already pending —
+        // the armed transfer must complete (be accepted) before another can
+        // be made, so the timelock clock can never be reset by re-proposing.
+        // Read as `Option<Address>` because `accept_admin` below clears the
+        // slot by writing `None` rather than removing the key.
+        let pending: Option<Address> = env.storage().instance()
+            .get(&StorageKey::PendingAdmin)
+            .unwrap_or(None);
+        if pending.is_some() {
+            panic_with_error!(&env, Error::AdminTransferPending);
+        }
 
         let threshold: u32 = env
             .storage()
@@ -506,9 +525,14 @@ impl OracleVerifier {
             env.storage()
                 .instance()
                 .set(&StorageKey::PendingAdmin, &new_admin);
-            env.storage()
-                .instance()
-                .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
+            // Issue #457: arm the timelock at most once per transfer — never
+            // overwrite an already-armed `PendingAdminSince`, or the
+            // `ADMIN_TRANSFER_TIMELOCK` would restart from this later moment.
+            if !env.storage().instance().has(&StorageKey::PendingAdminSince) {
+                env.storage()
+                    .instance()
+                    .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
+            }
         } else {
             env.storage()
                 .instance()
@@ -2775,13 +2799,25 @@ impl OracleVerifier {
         let min_keep = (config.min_sample_size as usize).max(1);
 
         // Rank live entries by deviation, worst first, so trimming toward
-        // `min_keep` always drops the most extreme values.
+        // `min_keep` always drops the most extreme values. Ties are broken
+        // by value, then weight: when `min_keep` cuts through a run of equally
+        // deviant submissions, which of them survive must depend only on the
+        // submission set, not on the order oracles happened to submit in —
+        // otherwise the filtered set (and the median computed from it) would
+        // be order-dependent (issue #455).
         let mut order = [0usize; 100];
         for i in 0..n {
             order[i] = i;
         }
         let order_slice = &mut order[0..n];
-        order_slice.sort_unstable_by_key(|&i| core::cmp::Reverse((values[i].0 - median).abs()));
+        order_slice.sort_by(|&a, &b| {
+            let dev_a = (values[a].0 - median).abs();
+            let dev_b = (values[b].0 - median).abs();
+            core::cmp::Reverse(dev_a)
+                .cmp(&core::cmp::Reverse(dev_b))
+                .then(values[a].0.cmp(&values[b].0))
+                .then(values[a].1.cmp(&values[b].1))
+        });
 
         let mut is_outlier = [false; 100];
         let mut flagged = 0usize;
@@ -2909,8 +2945,15 @@ impl OracleVerifier {
     /// minority of oracles cannot move the result no matter how extreme their
     /// submissions are. That property is why this is the default.
     fn weighted_median(values: &mut [(i128, u32)], total_weight: u32) -> i128 {
-        // Native sort on the stack slice: O(N log N)
-        values.sort_unstable_by_key(|&(val, _)| val);
+        // Sort on a total order — value first, then weight — so the sorted
+        // sequence (and therefore the median) is a pure function of the set
+        // of submissions, never of the order the storage vector happened to
+        // be enumerated in (issue #455). Sorting on value alone with an
+        // unstable sort leaves equal-valued entries in an arbitrary order,
+        // and the exact-halves branch below — which averages `val` with its
+        // successor — can then return a different answer for the same data
+        // depending on oracle submission order.
+        values.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
         let n = values.len();
 
         let half = total_weight / 2;

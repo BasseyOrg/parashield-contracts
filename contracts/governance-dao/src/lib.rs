@@ -760,6 +760,23 @@ impl GovernanceDao {
             panic_with_error!(&env, Error::NoProposals);
         }
 
+        // Issue #456: validate the batch's arguments before touching any
+        // state. The batch carries one shared `choice`, so the "proposal
+        // count must match the vote arguments" contract collapses to: every
+        // entry must name a distinct proposal. A repeated id passes Pass 1
+        // (no vote record exists yet) but is processed twice in Pass 2 — the
+        // second pass re-tallies from a stale copy and, worse, overwrites the
+        // first proposal's token lock with 0, stranding the voter's locked
+        // balance with no refund path through `withdraw_tokens`.
+        for i in 0..proposal_ids.len() {
+            let proposal_id = proposal_ids.get_unchecked(i);
+            for j in (i + 1)..proposal_ids.len() {
+                if proposal_ids.get_unchecked(j) == proposal_id {
+                    panic_with_error!(&env, Error::InvalidInput);
+                }
+            }
+        }
+
         // A holder who has delegated away their vote cannot also vote it.
         if env
             .storage()
