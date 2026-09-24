@@ -12,6 +12,10 @@
 //! Quorum: configurable % of total supply; configurable majority to pass
 //!
 //! v2 — full implementation; DAO is now deployable and testable.
+// Address/state validation must fail with a typed contract error so callers
+// can match on it programmatically, never with a raw panic! and a string
+// message.
+#![deny(clippy::panic)]
 #![no_std]
 extern crate alloc;
 
@@ -36,14 +40,8 @@ const MIN_VOTING_PERIOD: u64 = 3_600;
 /// an unreachably large period that would cause vote_end + FINALIZE_DELAY to
 /// overflow or make proposals permanently unresolvable.
 const MAX_VOTING_PERIOD: u64 = 30 * 24 * 3_600;
-/// Storage TTL threshold for proposal-related entries
-// Issue #342: kept in sync by hand across all 5 contracts (governance-dao,
-// risk-pool, policy-engine, oracle-verifier, claims-processor) — extracting
-// to a shared crate is a real follow-up, not done here to avoid touching
-// every contract's Cargo.toml in one pass.
-const TTL_THRESHOLD: u32 = 518_400; // ~30 days
-/// Storage TTL extension target for proposal-related entries
-const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
+// Shared protocol constants — single source of truth in parashield-common (issue #342).
+use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO};
 /// Minimum delay after vote_end before finalize() can be called
 const FINALIZE_DELAY: u64 = 300; // 5 minutes
 /// How long a proposal must sit unfinalized past `vote_end` before its

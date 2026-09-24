@@ -12,6 +12,10 @@
 //! - Only the admin can register/remove oracle addresses.
 //! - Any oracle already registered for a (data_type) may submit data.
 //! - Duplicate submissions from the same oracle overwrite the previous value.
+// Address/state validation must fail with a typed contract error so callers
+// can match on it programmatically, never with a raw panic! and a string
+// message.
+#![deny(clippy::panic)]
 #![no_std]
 extern crate alloc;
 
@@ -25,23 +29,8 @@ pub mod types;
 pub use types::*;
 
 // ─── Storage TTL ──────────────────────────────────────────────────────────────
-/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
-/// (at ~5s/ledger).
-// Issue #342: kept in sync by hand across all 5 contracts (governance-dao,
-// risk-pool, policy-engine, oracle-verifier, claims-processor) — extracting
-// to a shared crate is a real follow-up, not done here to avoid touching
-// every contract's Cargo.toml in one pass.
-const TTL_THRESHOLD: u32 = 518_400; // ~30 days
-/// Extend persistent entries out to ~1 year (at ~5s/ledger) so an oracle
-/// registration doesn't silently expire from storage during a quiet period
-/// with no submissions.
-const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
-
-/// Grace period between an admin transfer being fully proposed/approved and the
-/// proposed admin being able to `accept_admin` (issue #356). Hand-synced across
-/// the 4 contracts that expose admin rotation (policy-engine, risk-pool,
-/// oracle-verifier, claims-processor).
-const ADMIN_TRANSFER_TIMELOCK: u64 = 48 * 60 * 60;
+// Shared protocol constants — single source of truth in parashield-common (issue #342).
+use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK};
 
 /// Maximum number of registered oracles. Bounds the median aggregation loop and
 /// the worst-case weighted sum (MAX_ORACLES * max_weight * max_value) so it
