@@ -149,6 +149,9 @@ pub enum Error {
     /// Identity verification required for this claim category but not verified.
     IdentityVerificationRequired = 21,
     InvalidInput = 22,
+    /// An admin transfer was proposed while another one is still pending,
+    /// which would reset the transfer timelock (issue #457).
+    AdminTransferPending = 23,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -1101,11 +1104,25 @@ impl ClaimsProcessor {
     /// proposal is not armed until `threshold` guardians call
     /// `approve_admin_change`. Once armed, `new_admin` must call `accept_admin`
     /// — and that only succeeds after `ADMIN_TRANSFER_TIMELOCK` has elapsed, so
-    /// a hostile or mistaken rotation has a 48h window to be noticed and
-    /// countered with a fresh `propose_new_admin`.
+    /// a hostile or mistaken rotation has a 48h window to be noticed.
+    ///
+    /// Panics with `AdminTransferPending` while a transfer is already armed:
+    /// re-proposing over an armed transfer would rewrite `PendingAdminSince`
+    /// and reset the `ADMIN_TRANSFER_TIMELOCK`, letting the current admin
+    /// keep a transfer perpetually un-acceptable (issue #457).
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
         Self::validate_stellar_address(&env, &new_admin);
+
+        // Issue #457: reject a fresh proposal while one is already pending —
+        // the armed transfer must complete (be accepted) before another can
+        // be made, so the timelock clock can never be reset by re-proposing.
+        let pending: Option<Address> = env.storage().instance()
+            .get(&StorageKey::PendingAdmin)
+            .unwrap_or(None);
+        if pending.is_some() {
+            panic_with_error!(&env, Error::AdminTransferPending);
+        }
 
         let threshold: u32 = env
             .storage()
@@ -1176,9 +1193,14 @@ impl ClaimsProcessor {
         if pending.approvals.len() >= threshold {
             env.storage().instance().remove(&StorageKey::PendingAdminChange);
             env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
-            env.storage()
-                .instance()
-                .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
+            // Issue #457: arm the timelock at most once per transfer — never
+            // overwrite an already-armed `PendingAdminSince`, or the
+            // `ADMIN_TRANSFER_TIMELOCK` would restart from this later moment.
+            if !env.storage().instance().has(&StorageKey::PendingAdminSince) {
+                env.storage()
+                    .instance()
+                    .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
+            }
         } else {
             env.storage()
                 .instance()

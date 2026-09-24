@@ -104,6 +104,9 @@ pub enum Error {
     AdminTimelockNotExpired = 24,
     InvalidAddress = 25,
     InvalidVersion = 26,
+    /// An admin transfer was proposed while another one is still pending,
+    /// which would reset the transfer timelock (issue #457).
+    AdminTransferPending = 27,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -770,8 +773,22 @@ impl PolicyEngine {
     }
 
     /// Propose a new admin. Only the current admin can call this.
+    ///
+    /// Panics with `AdminTransferPending` while a transfer is already pending:
+    /// re-proposing would rewrite `PendingAdminSince` and reset the
+    /// `ADMIN_TRANSFER_TIMELOCK`, letting the current admin keep a transfer
+    /// perpetually un-acceptable (issue #457).
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
+        // Issue #457: reject a fresh proposal while one is already pending —
+        // the armed transfer must complete (be accepted) before another can
+        // be made, so the timelock clock can never be reset by re-proposing.
+        let pending: Option<Address> = env.storage().instance()
+            .get(&StorageKey::PendingAdmin)
+            .unwrap_or(None);
+        if pending.is_some() {
+            panic_with_error!(&env, Error::AdminTransferPending);
+        }
         // Store the proposed admin and arm the timelock (issue #356).
         env.storage()
             .instance()
