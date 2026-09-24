@@ -1074,3 +1074,278 @@ fn test_batch_submit_and_process_claims() {
     assert_eq!(cp.get_pending_claims().len(), 0);
 }
 
+// ── Fraud detection (issue #437) ─────────────────────────────────────────────
+
+/// Values chosen so any single rule alone hits the threshold in tests that
+/// need one rule to be decisive. `MAX_FRAUD_SCORE` (100) is the enforced
+/// ceiling on `fraud_threshold_score`.
+fn strict_block_config() -> FraudConfig {
+    FraudConfig {
+        rate_window_secs: 60,
+        rate_score: 40,
+        burst_window_secs: 24 * 3600,
+        burst_count: 3,
+        burst_score: 30,
+        coverage_anomaly_multiplier: 10,
+        coverage_score: 20,
+        fraud_threshold_score: 30, // any of the three rules alone flags it
+        mode: FraudMode::Block,
+    }
+}
+
+/// Empty history (never-seen-before claimant), what the detector reads on a
+/// first-ever submission.
+fn empty_history() -> ClaimantHistory {
+    ClaimantHistory {
+        last_submission_at: 0,
+        burst_bucket_start: 0,
+        burst_count: 0,
+        max_coverage_ever: 0,
+        total_submissions: 0,
+    }
+}
+
+// ── score_submission pure-function tests ─────────────────────────────────────
+
+#[test]
+fn fraud_score_is_zero_for_first_ever_submission() {
+    let cfg = strict_block_config();
+    let (score, flags) = ClaimsProcessor::score_submission(&cfg, 1_000, &empty_history(), 500_000_000);
+    assert_eq!(score, 0);
+    assert_eq!(flags, 0);
+}
+
+#[test]
+fn fraud_score_fires_rate_rule_inside_window() {
+    let cfg = strict_block_config();
+    let hist = ClaimantHistory {
+        last_submission_at: 1_000,
+        burst_bucket_start: 1_000,
+        burst_count: 1,
+        max_coverage_ever: 500_000_000,
+        total_submissions: 1,
+    };
+    // 30 seconds since last, well inside 60s rate window.
+    let (score, flags) = ClaimsProcessor::score_submission(&cfg, 1_030, &hist, 500_000_000);
+    assert_eq!(score, cfg.rate_score);
+    assert_eq!(flags, 1); // FRAUD_FLAG_RATE
+}
+
+#[test]
+fn fraud_score_skips_rate_rule_outside_window() {
+    let cfg = strict_block_config();
+    let hist = ClaimantHistory {
+        last_submission_at: 1_000,
+        burst_bucket_start: 1_000,
+        burst_count: 1,
+        max_coverage_ever: 500_000_000,
+        total_submissions: 1,
+    };
+    // 61 seconds since last, one past the boundary.
+    let (score, flags) = ClaimsProcessor::score_submission(&cfg, 1_061, &hist, 500_000_000);
+    // Rate rule does not fire; burst rule does not fire (only 2 in bucket).
+    // Coverage anomaly does not fire because coverage == max_coverage_ever.
+    assert_eq!(score, 0);
+    assert_eq!(flags, 0);
+}
+
+#[test]
+fn fraud_score_fires_burst_rule_at_configured_count() {
+    let cfg = strict_block_config();
+    // Simulated: claimant already has 2 submissions in the current bucket;
+    // this one would be the 3rd, matching `burst_count`.
+    let hist = ClaimantHistory {
+        last_submission_at: 1_000,
+        burst_bucket_start: 500,
+        burst_count: 2,
+        max_coverage_ever: 500_000_000,
+        total_submissions: 2,
+    };
+    // 65s after last, outside rate window so only burst can fire.
+    let (score, flags) = ClaimsProcessor::score_submission(&cfg, 1_065, &hist, 500_000_000);
+    assert_eq!(score, cfg.burst_score);
+    assert_eq!(flags, 2); // FRAUD_FLAG_BURST
+}
+
+#[test]
+fn fraud_score_fires_coverage_anomaly_beyond_multiplier() {
+    let cfg = strict_block_config();
+    let hist = ClaimantHistory {
+        last_submission_at: 1_000,
+        burst_bucket_start: 500,
+        burst_count: 1,
+        max_coverage_ever: 100_000_000,
+        total_submissions: 1,
+    };
+    // 65s after last (outside rate), coverage 10.01x max — anomaly fires.
+    let over = 100_000_000i128
+        .saturating_mul(cfg.coverage_anomaly_multiplier as i128)
+        .saturating_add(1);
+    let (score, flags) = ClaimsProcessor::score_submission(&cfg, 1_065, &hist, over);
+    assert_eq!(score, cfg.coverage_score);
+    assert_eq!(flags, 4); // FRAUD_FLAG_COVERAGE
+}
+
+#[test]
+fn fraud_score_zeroed_when_config_windows_all_off() {
+    let cfg = FraudConfig {
+        rate_window_secs: 0,
+        rate_score: 40,
+        burst_window_secs: 0,
+        burst_count: 0,
+        burst_score: 30,
+        coverage_anomaly_multiplier: 0,
+        coverage_score: 20,
+        fraud_threshold_score: 1,
+        mode: FraudMode::Block,
+    };
+    let hist = ClaimantHistory {
+        last_submission_at: 1_000,
+        burst_bucket_start: 500,
+        burst_count: 10,
+        max_coverage_ever: 100_000_000,
+        total_submissions: 10,
+    };
+    let (score, flags) = ClaimsProcessor::score_submission(&cfg, 1_100, &hist, 10_000_000_000);
+    assert_eq!(score, 0);
+    assert_eq!(flags, 0);
+}
+
+// ── End-to-end tests through submit_claim ────────────────────────────────────
+
+/// Without any `FraudConfig`, existing submission semantics are unchanged.
+#[test]
+fn no_fraud_config_leaves_submission_unchanged() {
+    let w = deploy();
+    // Advance the ledger so submission timestamps are nonzero; the default
+    // test env starts at t=0, which the detector treats as "never submitted".
+    w.env.ledger().with_mut(|l| l.timestamp = 1_700_000_000);
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    assert_eq!(cp.get_fraud_config(), None);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    // Detector wrote no record: FraudRecord for the just-created claim is absent.
+    assert_eq!(cp.get_fraud_record(&claim_id), None);
+    // But the history aggregate is maintained regardless, so turning the
+    // detector on later immediately has correct state to work with.
+    let hist = cp.get_claimant_history(&buyer);
+    assert_eq!(hist.total_submissions, 1);
+    assert!(hist.last_submission_at > 0);
+}
+
+/// Non-admin cannot configure the fraud detector.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_set_fraud_config() {
+    let w = deploy();
+    let interloper = Address::generate(&w.env);
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .set_fraud_config(&interloper, &strict_block_config());
+}
+
+/// `fraud_threshold_score` above 100 is rejected as invalid input.
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")]
+fn fraud_threshold_above_max_rejected() {
+    let w = deploy();
+    let mut cfg = strict_block_config();
+    cfg.fraud_threshold_score = 101;
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .set_fraud_config(&w.admin, &cfg);
+}
+
+/// In `Block` mode, a burst-triggering submission panics with
+/// `FraudSuspected` and writes no claim state.
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn block_mode_rejects_burst_triggering_submission() {
+    let w = deploy();
+    // Advance the ledger so submission timestamps are nonzero; the rate
+    // rule only fires when `history.last_submission_at > 0`, and the
+    // default test env starts at t=0.
+    w.env.ledger().with_mut(|l| l.timestamp = 1_700_000_000);
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    // Preload the claimant's history so this test does not depend on the
+    // burst-of-3-different-policies choreography, which is the same code
+    // path the pure `fraud_score_fires_burst_rule_at_configured_count`
+    // test covers. This test exercises the E2E gate.
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let mut cfg = strict_block_config();
+    // Rate rule needs no prior submission; set high enough that the
+    // first-ever claim can fire it via the history we plant below.
+    cfg.rate_score = 40;
+    cfg.fraud_threshold_score = 30;
+    cp.set_fraud_config(&w.admin, &cfg);
+
+    // Plant a history entry so the first real submission looks like a
+    // rapid resubmission.
+    let now = w.env.ledger().timestamp();
+    w.env.as_contract(&w.claims_id, || {
+        let hist = ClaimantHistory {
+            last_submission_at: now,
+            burst_bucket_start: now,
+            burst_count: 1,
+            max_coverage_ever: 100_000_000,
+            total_submissions: 1,
+        };
+        w.env.storage().persistent().set(
+            &StorageKey::ClaimantHistory(buyer.clone()),
+            &hist,
+        );
+    });
+
+    // This submission is inside the rate window relative to the planted
+    // history, so the rate rule fires with a score >= threshold. Panic
+    // expected — no claim state is written.
+    cp.submit_claim(&buyer, &pol_id);
+}
+
+/// In `FlagOnly` mode, the same submission is admitted and produces a
+/// `FraudRecord` an admin can read.
+#[test]
+fn flag_only_mode_records_but_admits_submission() {
+    let w = deploy();
+    // Advance the ledger so submission timestamps are nonzero; the rate
+    // rule only fires when `history.last_submission_at > 0`.
+    w.env.ledger().with_mut(|l| l.timestamp = 1_700_000_000);
+    let pid = create_crop_product(&w);
+    let buyer = Address::generate(&w.env);
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let mut cfg = strict_block_config();
+    cfg.mode = FraudMode::FlagOnly;
+    cp.set_fraud_config(&w.admin, &cfg);
+
+    let now = w.env.ledger().timestamp();
+    w.env.as_contract(&w.claims_id, || {
+        let hist = ClaimantHistory {
+            last_submission_at: now,
+            burst_bucket_start: now,
+            burst_count: 1,
+            max_coverage_ever: 100_000_000,
+            total_submissions: 1,
+        };
+        w.env.storage().persistent().set(
+            &StorageKey::ClaimantHistory(buyer.clone()),
+            &hist,
+        );
+    });
+
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    let record = cp.get_fraud_record(&claim_id).unwrap();
+    assert_eq!(record.claim_id, claim_id);
+    assert!(record.score >= cfg.fraud_threshold_score);
+    assert_eq!(record.flags & 1u32, 1u32); // rate rule fired
+}
