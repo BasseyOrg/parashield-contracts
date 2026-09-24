@@ -132,7 +132,7 @@ fn buy_crop_policy(w: &World, buyer: &Address, product_id: u128) -> u128 {
     // Fund the pool with coverage capital
     StellarAssetClient::new(&w.env, &w.usdc).mint(&w.pool_id, &10_000_000_000i128);
     // Deposit to pool and lock coverage for the policy
-    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&buyer, &1_000_000_000i128, &0i128);
+    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&buyer, &1_000_000_000i128, &0i128, &false);
 
     let policy_id = PolicyEngineClient::new(&w.env, &w.policy_id).buy_policy(
         buyer,
@@ -187,7 +187,7 @@ fn test_batch_auto_process_boundary_conditions() {
 
     // All should be paid
     for (_, result) in results.iter() {
-        assert_eq!(*result, ClaimResult::Paid);
+        assert_eq!(result, ClaimResult::Paid);
     }
 
     // Verify all policies are now Claimed
@@ -311,7 +311,7 @@ fn test_staleness_threshold_boundary() {
     let buyer = Address::generate(&env);
     StellarAssetClient::new(&env, &usdc).mint(&buyer, &5_000_000_000i128);
     StellarAssetClient::new(&env, &usdc).mint(&pool_id, &10_000_000_000i128);
-    RiskPoolClient::new(&env, &pool_id).deposit(&buyer, &1_000_000_000i128, &0i128);
+    RiskPoolClient::new(&env, &pool_id).deposit(&buyer, &1_000_000_000i128, &0i128, &false);
 
     let pol_id = PolicyEngineClient::new(&env, &policy_id).buy_policy(
         &buyer,
@@ -334,7 +334,7 @@ fn test_staleness_threshold_boundary() {
 
     // Process immediately - should succeed (data is fresh)
     let cp = ClaimsProcessorClient::new(&env, &claims_id);
-    let result1 = cp.auto_process(&keeper, &pol_id);
+    let result1 = cp.auto_process(&keeper, &pol_id, &None);
     assert_eq!(result1, ClaimResult::Paid);
 }
 
@@ -349,7 +349,7 @@ fn test_multi_contract_interaction_atomicity() {
     submit_rainfall(&w, 20_000_000);
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    let result = cp.auto_process(&w.keeper, &pol_id);
+    let result = cp.auto_process(&w.keeper, &pol_id, &None);
 
     // Verify successful payout
     assert_eq!(result, ClaimResult::Paid);
@@ -378,7 +378,7 @@ fn test_policy_exactly_at_expiration() {
     w.env.ledger().with_mut(|l| l.timestamp = policy.end_time);
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    let result = cp.auto_process(&w.keeper, &pol_id);
+    let result = cp.auto_process(&w.keeper, &pol_id, &None);
 
     // Should be expired
     assert_eq!(result, ClaimResult::Expired);
@@ -396,7 +396,7 @@ fn test_oracle_data_at_boundary_threshold() {
     submit_rainfall(&w, 50_000_000);
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    let result = cp.auto_process(&w.keeper, &pol_id);
+    let result = cp.auto_process(&w.keeper, &pol_id, &None);
 
     // Should be rejected (not less than threshold)
     assert_eq!(result, ClaimResult::Rejected);
@@ -428,7 +428,7 @@ fn test_maximum_coverage_boundary() {
     let buyer = Address::generate(&w.env);
     StellarAssetClient::new(&w.env, &w.usdc).mint(&buyer, &50_000_000_000i128);
     StellarAssetClient::new(&w.env, &w.usdc).mint(&w.pool_id, &20_000_000_000i128);
-    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&buyer, &10_000_000_000i128, &0i128);
+    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&buyer, &10_000_000_000i128, &0i128, &false);
 
     // Buy policy at maximum coverage
     let pol_id = PolicyEngineClient::new(&w.env, &w.policy_id).buy_policy(
@@ -443,7 +443,7 @@ fn test_maximum_coverage_boundary() {
     submit_rainfall(&w, 20_000_000);
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    let result = cp.auto_process(&w.keeper, &pol_id);
+    let result = cp.auto_process(&w.keeper, &pol_id, &None);
 
     assert_eq!(result, ClaimResult::Paid);
 }
@@ -457,7 +457,7 @@ fn test_minimum_coverage_boundary() {
 
     StellarAssetClient::new(&w.env, &w.usdc).mint(&buyer, &1_000_000_000i128);
     StellarAssetClient::new(&w.env, &w.usdc).mint(&w.pool_id, &1_000_000_000i128);
-    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&buyer, &100_000_000i128, &0i128);
+    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&buyer, &100_000_000i128, &0i128, &false);
 
     // Buy policy at minimum coverage
     let pol_id = PolicyEngineClient::new(&w.env, &w.policy_id).buy_policy(
@@ -472,7 +472,7 @@ fn test_minimum_coverage_boundary() {
     submit_rainfall(&w, 20_000_000);
 
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
-    let result = cp.auto_process(&w.keeper, &pol_id);
+    let result = cp.auto_process(&w.keeper, &pol_id, &None);
 
     assert_eq!(result, ClaimResult::Paid);
 }
@@ -506,9 +506,9 @@ fn test_concurrent_claim_submissions() {
     assert_ne!(claim_id1, claim_id3);
 
     // Process all claims
-    let res1 = cp.process_claim(&w.keeper, claim_id1);
-    let res2 = cp.process_claim(&w.keeper, claim_id2);
-    let res3 = cp.process_claim(&w.keeper, claim_id3);
+    let res1 = cp.process_claim(&w.keeper, &claim_id1, &None);
+    let res2 = cp.process_claim(&w.keeper, &claim_id2, &None);
+    let res3 = cp.process_claim(&w.keeper, &claim_id3, &None);
 
     assert_eq!(res1, ClaimResult::Paid);
     assert_eq!(res2, ClaimResult::Paid);
@@ -532,7 +532,7 @@ fn test_pending_queue_drained_after_settlement() {
 
     // Settling it (trigger met → Paid) must drain it from the queue.
     submit_rainfall(&w, 20_000_000);
-    let result = cp.process_claim(&w.keeper, claim_id);
+    let result = cp.process_claim(&w.keeper, &claim_id, &None);
     assert_eq!(result, ClaimResult::Paid);
     assert_eq!(
         cp.get_pending_claims().len(),

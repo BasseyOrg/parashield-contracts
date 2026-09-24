@@ -199,7 +199,7 @@ fn batch_skips_non_pending_claims() {
     );
     let _claim_id = claims_client.submit_claim(&farmer, &p1);
     // Process it once
-    claims_client.auto_process(&te.admin, &p1);
+    claims_client.auto_process(&te.admin, &p1, &None);
     // Batch with limit=10 should return 0 results (already processed)
     let results = claims_client.batch_auto_process(&te.admin, &10u32);
     assert_eq!(results.len(), 0);
@@ -249,7 +249,7 @@ fn test_stale_oracle_data_rejected() {
     te.env.ledger().with_mut(|l| l.timestamp = stale_now);
 
     // auto_process must panic — StaleData error from oracle-verifier
-    claims_client.auto_process(&te.admin, &pol_id);
+    claims_client.auto_process(&te.admin, &pol_id, &None);
 }
 
 /// auto_process succeeds when oracle data is within the staleness threshold.
@@ -293,7 +293,7 @@ fn test_fresh_oracle_data_accepted() {
     te.env.ledger().with_mut(|l| l.timestamp = fresh_now);
 
     // Should succeed and pay out (30mm < 500mm threshold triggers drought product)
-    let result = claims_client.auto_process(&te.admin, &pol_id);
+    let result = claims_client.auto_process(&te.admin, &pol_id, &None);
     assert_eq!(result, ClaimResult::Paid);
 }
 
@@ -348,7 +348,7 @@ fn test_equal_comparison() {
     let fresh_now = data_ts + 3_600;
     te.env.ledger().with_mut(|l| l.timestamp = fresh_now);
 
-    let result = claims_client.auto_process(&te.admin, &pol_id);
+    let result = claims_client.auto_process(&te.admin, &pol_id, &None);
     assert_eq!(result, ClaimResult::Paid);
 }
 
