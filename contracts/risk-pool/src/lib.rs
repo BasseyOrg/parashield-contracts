@@ -11,6 +11,10 @@
 //! - Target APY: 8-40% depending on risk category
 //!
 //! v2 — full implementation; Risk Pool is now deployable and testable.
+// Address/state validation must fail with a typed contract error so callers
+// can match on it programmatically, never with a raw panic! and a string
+// message.
+#![deny(clippy::panic)]
 #![no_std]
 extern crate alloc;
 use alloc::string::ToString;
@@ -72,22 +76,8 @@ const TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// Shorter than withdrawal timelock since parameter changes are less risky.
 const PARAMETER_TIMELOCK_SECONDS: u64 = 2 * 24 * 60 * 60;
 
-/// Grace period between an admin transfer being fully proposed/approved and the
-/// proposed admin being able to `accept_admin` (issue #356). Hand-synced across
-/// the 4 contracts that expose admin rotation (policy-engine, risk-pool,
-/// oracle-verifier, claims-processor).
-const ADMIN_TRANSFER_TIMELOCK: u64 = 48 * 60 * 60;
-
-/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
-/// (at ~5s/ledger).
-// Issue #342: kept in sync by hand across all 5 contracts (governance-dao,
-// risk-pool, policy-engine, oracle-verifier, claims-processor) — extracting
-// to a shared crate is a real follow-up, not done here to avoid touching
-// every contract's Cargo.toml in one pass.
-const TTL_THRESHOLD: u32 = 518_400;
-/// Extend persistent entries out to ~1 year (at ~5s/ledger) so capital locks
-/// backing long-dated policies don't expire from storage before maturity.
-const TTL_EXTEND_TO: u32 = 6_312_000;
+// Shared protocol constants — single source of truth in parashield-common (issue #342).
+use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK};
 
 #[contracttype]
 enum StorageKey {
@@ -205,6 +195,9 @@ pub enum Error {
     InvalidReinsuranceConfig  = 37,
     InvalidParameter          = 38,
     InvalidFeeTier            = 39,
+    /// An admin transfer was proposed while another transfer is still
+    /// pending, which would reset the transfer timelock (issue #457).
+    AdminTransferPending      = 40,
 }
 
 #[contract]
@@ -335,14 +328,24 @@ impl RiskPool {
             panic_with_error!(&env, Error::PoolCapExceeded);
         }
 
+        // Both branches use checked arithmetic: a share calculation that
+        // cannot be represented traps as a typed `Overflow` rather than
+        // silently wrapping or truncating (issue #454).
         let new_shares = if total_deposited == 0 {
-            amount * 1_000_000_000  // 1 share = 1 USDC * 1e9 precision
+            amount.checked_mul(1_000_000_000)  // 1 share = 1 USDC * 1e9 precision
+                .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow))
         } else {
             amount.checked_mul(total_shares)
                 .and_then(|v| v.checked_div(total_deposited))
                 .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow))
         };
 
+        // Issue #454: `amount * total_shares / total_deposited` truncates
+        // toward zero, so a deposit that is small relative to the pool can
+        // round to 0 shares. MIN_DEPOSIT alone cannot rule this out (the
+        // share-to-deposit ratio is not fixed), and without this guard the
+        // depositor's tokens would be taken while nothing is minted in
+        // return — an irreversible loss. Reject instead.
         if new_shares == 0 {
             panic_with_error!(&env, Error::ZeroAmount);
         }
@@ -2142,9 +2145,24 @@ impl RiskPool {
     /// guardians to call `approve_admin_change` first, guarding this
     /// takeover-capable operation against a single compromised admin key.
     /// With no guardians configured (default), behavior is unchanged.
+    ///
+    /// Panics with `AdminTransferPending` while a transfer is already armed:
+    /// re-proposing over an armed transfer would rewrite `PendingAdminSince`
+    /// and reset the `ADMIN_TRANSFER_TIMELOCK`, letting the current admin
+    /// keep a transfer perpetually un-acceptable (issue #457).
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
         Self::validate_stellar_address(&env, &new_admin);
+
+        // Issue #457: reject a fresh proposal while one is already pending —
+        // the armed transfer must complete (be accepted) before another can
+        // be made, so the timelock clock can never be reset by re-proposing.
+        let pending: Option<Address> = env.storage().instance()
+            .get(&StorageKey::PendingAdmin)
+            .unwrap_or(None);
+        if pending.is_some() {
+            panic_with_error!(&env, Error::AdminTransferPending);
+        }
 
         let threshold: u32 = env
             .storage()
@@ -2214,9 +2232,14 @@ impl RiskPool {
         if pending.approvals.len() >= threshold {
             env.storage().instance().remove(&StorageKey::PendingAdminChange);
             env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
-            env.storage()
-                .instance()
-                .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
+            // Issue #457: arm the timelock at most once per transfer — never
+            // overwrite an already-armed `PendingAdminSince`, or the
+            // `ADMIN_TRANSFER_TIMELOCK` would restart from this later moment.
+            if !env.storage().instance().has(&StorageKey::PendingAdminSince) {
+                env.storage()
+                    .instance()
+                    .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
+            }
         } else {
             env.storage()
                 .instance()

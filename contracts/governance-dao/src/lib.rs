@@ -12,6 +12,10 @@
 //! Quorum: configurable % of total supply; configurable majority to pass
 //!
 //! v2 — full implementation; DAO is now deployable and testable.
+// Address/state validation must fail with a typed contract error so callers
+// can match on it programmatically, never with a raw panic! and a string
+// message.
+#![deny(clippy::panic)]
 #![no_std]
 extern crate alloc;
 
@@ -36,14 +40,8 @@ const MIN_VOTING_PERIOD: u64 = 3_600;
 /// an unreachably large period that would cause vote_end + FINALIZE_DELAY to
 /// overflow or make proposals permanently unresolvable.
 const MAX_VOTING_PERIOD: u64 = 30 * 24 * 3_600;
-/// Storage TTL threshold for proposal-related entries
-// Issue #342: kept in sync by hand across all 5 contracts (governance-dao,
-// risk-pool, policy-engine, oracle-verifier, claims-processor) — extracting
-// to a shared crate is a real follow-up, not done here to avoid touching
-// every contract's Cargo.toml in one pass.
-const TTL_THRESHOLD: u32 = 518_400; // ~30 days
-/// Storage TTL extension target for proposal-related entries
-const TTL_EXTEND_TO: u32 = 6_312_000; // ~1 year
+// Shared protocol constants — single source of truth in parashield-common (issue #342).
+use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO};
 /// Minimum delay after vote_end before finalize() can be called
 const FINALIZE_DELAY: u64 = 300; // 5 minutes
 /// How long a proposal must sit unfinalized past `vote_end` before its
@@ -72,6 +70,23 @@ const MAX_PARTICIPATION_WINDOW: u32 = 20;
 /// delegate list would eventually make voting cost more instructions than a
 /// transaction can carry, which would lock that delegate out entirely.
 const MAX_DELEGATORS: u32 = 50;
+
+/// Impact-multiplier basis points floor: 10_000 = 1x. A multiplier below this
+/// would lower the deposit / weight requirement below the configured base,
+/// which is not what an escalation feature should ever do (issue #438).
+const MIN_MULTIPLIER_BPS: u32 = 10_000;
+/// Impact-multiplier basis points ceiling: 100_000 = 10x. A single stray
+/// keystroke could otherwise brick proposal creation entirely by demanding
+/// more tokens than exist. Ten times the base is already an aggressive
+/// escalation and covers every realistic threat model without leaving a
+/// footgun.
+const MAX_MULTIPLIER_BPS: u32 = 100_000;
+// Recommended shipped defaults, documented on `ImpactMultipliers` in
+// `types.rs`: 1x for `standard_bps`, 5x for `upgrade_bps`, 3x for
+// `self_target_bps`. Not constants here because the setter is
+// value-driven — the admin passes explicit multipliers, not a "use
+// defaults" flag — so introducing named constants only for the doc
+// comment would leave `dead_code` in the crate.
 
 #[contracttype]
 enum StorageKey {
@@ -114,6 +129,10 @@ enum StorageKey {
     ProposalComment(u128),
     /// Next comment ID counter for a proposal — proposal_id -> u128.
     NextCommentId(u64),
+    /// Impact-based escalation multipliers applied on top of the base
+    /// `DaoConfig.proposal_threshold` at proposal creation time. Absent =
+    /// no escalation (behaves as 1x for every proposal kind). Issue #438.
+    ImpactMultipliers,
 }
 
 
@@ -165,6 +184,10 @@ pub enum Error {
     ExecutionDeadlineExpired = 42,
     /// Proposal has been vetoed by a guardian and can never be executed.
     ProposalVetoed = 43,
+    /// `set_impact_multipliers` was called with a multiplier below
+    /// `MIN_MULTIPLIER_BPS` (would de-escalate) or above `MAX_MULTIPLIER_BPS`
+    /// (would brick proposal creation). Issue #438.
+    InvalidImpactMultiplier = 44,
 }
 
 #[contract]
@@ -266,15 +289,21 @@ impl GovernanceDao {
             .get(&StorageKey::Config)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
 
+        // Issue #438: apply impact-based escalation on top of the base
+        // threshold. `ProposalKind::Standard` with target == this contract
+        // pays the self-target multiplier so a proposer cannot bypass
+        // upgrade-tier gating by wrapping a self-mutation in a Standard call.
+        let deposit = Self::effective_threshold(&env, &ProposalKind::Standard, &target);
+
         let gov_token = token::Client::new(&env, &config.gov_token);
         let weight = gov_token.balance(&proposer);
-        if weight < config.proposal_threshold {
+        if weight < deposit {
             panic_with_error!(&env, Error::InsufficientWeight);
         }
-        // Lock the threshold as it stands right now; this exact amount
-        // (not whatever config.proposal_threshold reads as later) is what
-        // finalize() must refund, so it's captured on the Proposal below.
-        let deposit = config.proposal_threshold;
+        // Lock the exact amount that gated this proposal; finalize() refunds
+        // it verbatim from the Proposal record, so a later change to the
+        // base threshold or the multipliers does not distort refunds already
+        // in flight.
         gov_token.transfer(
             &proposer,
             &env.current_contract_address(),
@@ -376,12 +405,15 @@ impl GovernanceDao {
             .get(&StorageKey::Config)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
 
+        // Issue #438: contract upgrades are the highest-impact governance
+        // action; apply the Upgrade multiplier on top of the base threshold.
+        let deposit = Self::effective_threshold(&env, &ProposalKind::Upgrade, &target);
+
         let gov_token = token::Client::new(&env, &config.gov_token);
         let weight = gov_token.balance(&proposer);
-        if weight < config.proposal_threshold {
+        if weight < deposit {
             panic_with_error!(&env, Error::InsufficientWeight);
         }
-        let deposit = config.proposal_threshold;
         gov_token.transfer(&proposer, &env.current_contract_address(), &deposit);
 
         let proposal_id: u64 = env
@@ -760,6 +792,23 @@ impl GovernanceDao {
 
         if proposal_ids.is_empty() {
             panic_with_error!(&env, Error::NoProposals);
+        }
+
+        // Issue #456: validate the batch's arguments before touching any
+        // state. The batch carries one shared `choice`, so the "proposal
+        // count must match the vote arguments" contract collapses to: every
+        // entry must name a distinct proposal. A repeated id passes Pass 1
+        // (no vote record exists yet) but is processed twice in Pass 2 — the
+        // second pass re-tallies from a stale copy and, worse, overwrites the
+        // first proposal's token lock with 0, stranding the voter's locked
+        // balance with no refund path through `withdraw_tokens`.
+        for i in 0..proposal_ids.len() {
+            let proposal_id = proposal_ids.get_unchecked(i);
+            for j in (i + 1)..proposal_ids.len() {
+                if proposal_ids.get_unchecked(j) == proposal_id {
+                    panic_with_error!(&env, Error::InvalidInput);
+                }
+            }
         }
 
         // A holder who has delegated away their vote cannot also vote it.
@@ -1430,6 +1479,64 @@ impl GovernanceDao {
         Self::quorum_decay_config(&env)
     }
 
+    /// Configure impact-based proposal threshold escalation (issue #438).
+    ///
+    /// Every multiplier must fall in `[MIN_MULTIPLIER_BPS, MAX_MULTIPLIER_BPS]`
+    /// (i.e. between 1x and 10x). Values below `MIN_MULTIPLIER_BPS` would let
+    /// this feature *lower* the deposit gate below the configured base, which
+    /// defeats the point; values above `MAX_MULTIPLIER_BPS` risk demanding
+    /// more tokens than exist in circulation and bricking proposal creation.
+    ///
+    /// Admin-only. Emits `ImpactMultipliersUpdated`.
+    pub fn set_impact_multipliers(
+        env: Env,
+        admin: Address,
+        standard_bps: u32,
+        upgrade_bps: u32,
+        self_target_bps: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        for m in [standard_bps, upgrade_bps, self_target_bps].iter() {
+            if *m < MIN_MULTIPLIER_BPS || *m > MAX_MULTIPLIER_BPS {
+                panic_with_error!(&env, Error::InvalidImpactMultiplier);
+            }
+        }
+
+        let multipliers = ImpactMultipliers {
+            standard_bps,
+            upgrade_bps,
+            self_target_bps,
+        };
+        env.storage()
+            .instance()
+            .set(&StorageKey::ImpactMultipliers, &multipliers);
+
+        env.events().publish(
+            (Symbol::new(&env, "impact_multipliers_updated"),),
+            ImpactMultipliersUpdated {
+                standard_bps,
+                upgrade_bps,
+                self_target_bps,
+            },
+        );
+    }
+
+    /// The impact-based multipliers currently in effect. Returns the
+    /// historical 1x-across-the-board default when no admin has configured
+    /// them (issue #438).
+    pub fn get_impact_multipliers(env: Env) -> ImpactMultipliers {
+        Self::impact_multipliers(&env)
+    }
+
+    /// The gov-token deposit a proposal of the given `kind` and `target`
+    /// would require right now, after impact-based escalation (issue #438).
+    /// Callers can read this before invoking `create_proposal` /
+    /// `propose_upgrade` so they know exactly what will be locked.
+    pub fn get_effective_threshold(env: Env, kind: ProposalKind, target: Address) -> i128 {
+        Self::effective_threshold(&env, &kind, &target)
+    }
+
     /// Rolling participation history used to compute adaptive quorum.
     pub fn get_participation_history(env: Env) -> ParticipationHistory {
         Self::participation_history(&env)
@@ -1922,6 +2029,56 @@ impl GovernanceDao {
             .get_delegated_shares(voter)
     }
 
+
+    /// Impact-based escalation multipliers, or the historical 1x default
+    /// (issue #438). The default is chosen so a DAO that predates this
+    /// feature has exactly the same weight/deposit gate as before.
+    fn impact_multipliers(env: &Env) -> ImpactMultipliers {
+        env.storage()
+            .instance()
+            .get(&StorageKey::ImpactMultipliers)
+            .unwrap_or(ImpactMultipliers {
+                standard_bps: MIN_MULTIPLIER_BPS,
+                upgrade_bps: MIN_MULTIPLIER_BPS,
+                self_target_bps: MIN_MULTIPLIER_BPS,
+            })
+    }
+
+    /// The proposal_threshold effectively required for a proposal of the
+    /// given `kind` and `target`, in gov-token units. Base
+    /// `config.proposal_threshold` scaled by the applicable multiplier
+    /// (issue #438).
+    ///
+    /// Selection: `Upgrade` -> `upgrade_bps`; `Standard` with target == this
+    /// contract -> `self_target_bps`; otherwise `standard_bps`. Multiplication
+    /// uses saturating i128 arithmetic — an admin who configures a
+    /// pathological base + multiplier gets `i128::MAX` (bricks proposal
+    /// creation), which surfaces the misconfiguration rather than silently
+    /// wrapping.
+    fn effective_threshold(env: &Env, kind: &ProposalKind, target: &Address) -> i128 {
+        let config: DaoConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+
+        let mult = Self::impact_multipliers(env);
+        let mult_bps: i128 = match kind {
+            ProposalKind::Upgrade => mult.upgrade_bps as i128,
+            ProposalKind::Standard => {
+                if target == &env.current_contract_address() {
+                    mult.self_target_bps as i128
+                } else {
+                    mult.standard_bps as i128
+                }
+            }
+        };
+
+        config
+            .proposal_threshold
+            .saturating_mul(mult_bps)
+            .saturating_div(MIN_MULTIPLIER_BPS as i128)
+    }
 
     /// Adaptive-quorum settings, or the disabled default.
     fn quorum_decay_config(env: &Env) -> QuorumDecayConfig {

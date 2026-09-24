@@ -23,7 +23,7 @@ use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    Address, BytesN, Env, Vec, Symbol,
+    Address, BytesN, Env, Vec, Symbol, IntoVal,
 };
 
 pub mod types;
@@ -57,22 +57,8 @@ trait IOracleVerifier {
 
 // ─── Storage TTL ──────────────────────────────────────────────────────────────
 
-/// Extend a persistent entry's TTL once it has fewer than ~30 days of life left
-/// (at ~5s/ledger).
-// Issue #342: kept in sync by hand across all 5 contracts (governance-dao,
-// risk-pool, policy-engine, oracle-verifier, claims-processor) — extracting
-// to a shared crate is a real follow-up, not done here to avoid touching
-// every contract's Cargo.toml in one pass.
-const TTL_THRESHOLD: u32 = 518_400;
-/// Extend persistent entries out to ~1 year (at ~5s/ledger) so pending claims
-/// survive long enough to be processed.
-const TTL_EXTEND_TO: u32 = 6_312_000;
-
-/// Grace period between an admin transfer being fully proposed/approved and the
-/// proposed admin being able to `accept_admin` (issue #356). Hand-synced across
-/// the 4 contracts that expose admin rotation (policy-engine, risk-pool,
-/// oracle-verifier, claims-processor).
-const ADMIN_TRANSFER_TIMELOCK: u64 = 48 * 60 * 60;
+// Shared protocol constants — single source of truth in parashield-common (issue #342).
+use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK};
 
 // ─── Batch processing ─────────────────────────────────────────────────────────
 
@@ -173,10 +159,9 @@ pub enum Error {
     /// Identity verification required for this claim category but not verified.
     IdentityVerificationRequired = 21,
     InvalidInput = 22,
-    /// Fraud detector flagged this claim's submission and the current
-    /// `FraudMode` is `Block` (issue #437). No state was written for the
-    /// rejected claim.
-    FraudSuspected = 23,
+    /// An admin transfer was proposed while another one is still pending,
+    /// which would reset the transfer timelock (issue #457).
+    AdminTransferPending = 23,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -637,6 +622,13 @@ impl ClaimsProcessor {
     /// `u32::MAX`) is not an error — it simply settles the first
     /// `MAX_BATCH_SIZE` pending claims, keeping the transaction inside
     /// Soroban's instruction budget. Call again to drain the rest of the queue.
+    ///
+    /// Failure isolation: each claim is evaluated via a sub-invocation of
+    /// `auto_process` on this contract using `env.try_invoke_contract`. If
+    /// any individual claim's cross-contract calls panic (e.g. stale oracle
+    /// data, policy engine rejection, risk-pool error), that sub-invocation
+    /// returns `Err` and the claim is skipped — the batch itself never
+    /// aborts, so all other claims in the queue are still processed.
     pub fn batch_auto_process(env: Env, caller: Address, limit: u32) -> Vec<(u128, ClaimResult)> {
         Self::require_keeper(&env, &caller);
         Self::require_not_paused(&env);
@@ -652,24 +644,48 @@ impl ClaimsProcessor {
             effective_limit
         };
 
-        let policy_engine: Address = env.storage().instance()
-            .get(&StorageKey::PolicyEngine)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        let this = env.current_contract_address();
+        let fn_name = Symbol::new(&env, "auto_process");
 
         for i in 0..process_count {
             let claim_id = pending.get_unchecked(i);
-            let mut claim: Claim = match env.storage().persistent()
-                .get(&StorageKey::Claim(claim_id)) {
-                Some(c) => c,
-                None    => continue,
-            };
-            if claim.status != ClaimStatus::Pending { continue; }
-            if claim.processed_at.is_some() { continue; }
 
-            let policy = PolicyEngineClient::new(&env, &policy_engine)
-                .get_policy(&claim.policy_id);
-            let result = Self::evaluate_and_settle(&env, &mut claim, &policy, None);
-            results.push_back((claim_id, result));
+            // Pre-check: skip claims that are no longer Pending without
+            // spending a sub-invocation on them (fast path, no isolation cost).
+            let claim_opt: Option<Claim> = env.storage().persistent()
+                .get(&StorageKey::Claim(claim_id));
+            let policy_id = match &claim_opt {
+                None => continue,
+                Some(c) if c.status != ClaimStatus::Pending => continue,
+                Some(c) if c.processed_at.is_some() => continue,
+                Some(c) => c.policy_id,
+            };
+
+            // Each claim is evaluated in its own sub-invocation so that a
+            // panic inside (stale oracle, cross-contract failure, etc.) only
+            // rolls back that single claim, not the entire batch.
+            //
+            // auto_process(caller, policy_id, partial_payout_bps: None)
+            // None is encoded as the void Val in the args vector.
+            let none_val: soroban_sdk::Val = Option::<u32>::None.into_val(&env);
+            let args = soroban_sdk::vec![
+                &env,
+                caller.to_val(),
+                policy_id.into_val(&env),
+                none_val,
+            ];
+            match env.try_invoke_contract::<ClaimResult, soroban_sdk::Error>(
+                &this,
+                &fn_name,
+                args,
+            ) {
+                Ok(Ok(result)) => {
+                    results.push_back((claim_id, result));
+                }
+                // Sub-invocation failed or returned a contract error — skip
+                // this claim and continue processing the rest of the batch.
+                Ok(Err(_)) | Err(_) => continue,
+            }
         }
         results
     }
@@ -1136,11 +1152,25 @@ impl ClaimsProcessor {
     /// proposal is not armed until `threshold` guardians call
     /// `approve_admin_change`. Once armed, `new_admin` must call `accept_admin`
     /// — and that only succeeds after `ADMIN_TRANSFER_TIMELOCK` has elapsed, so
-    /// a hostile or mistaken rotation has a 48h window to be noticed and
-    /// countered with a fresh `propose_new_admin`.
+    /// a hostile or mistaken rotation has a 48h window to be noticed.
+    ///
+    /// Panics with `AdminTransferPending` while a transfer is already armed:
+    /// re-proposing over an armed transfer would rewrite `PendingAdminSince`
+    /// and reset the `ADMIN_TRANSFER_TIMELOCK`, letting the current admin
+    /// keep a transfer perpetually un-acceptable (issue #457).
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
         Self::validate_stellar_address(&env, &new_admin);
+
+        // Issue #457: reject a fresh proposal while one is already pending —
+        // the armed transfer must complete (be accepted) before another can
+        // be made, so the timelock clock can never be reset by re-proposing.
+        let pending: Option<Address> = env.storage().instance()
+            .get(&StorageKey::PendingAdmin)
+            .unwrap_or(None);
+        if pending.is_some() {
+            panic_with_error!(&env, Error::AdminTransferPending);
+        }
 
         let threshold: u32 = env
             .storage()
@@ -1211,9 +1241,14 @@ impl ClaimsProcessor {
         if pending.approvals.len() >= threshold {
             env.storage().instance().remove(&StorageKey::PendingAdminChange);
             env.storage().instance().set(&StorageKey::PendingAdmin, &new_admin);
-            env.storage()
-                .instance()
-                .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
+            // Issue #457: arm the timelock at most once per transfer — never
+            // overwrite an already-armed `PendingAdminSince`, or the
+            // `ADMIN_TRANSFER_TIMELOCK` would restart from this later moment.
+            if !env.storage().instance().has(&StorageKey::PendingAdminSince) {
+                env.storage()
+                    .instance()
+                    .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
+            }
         } else {
             env.storage()
                 .instance()
