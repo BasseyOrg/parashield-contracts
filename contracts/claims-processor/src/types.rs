@@ -374,3 +374,114 @@ pub struct ClaimPaidInAlternativeCurrency {
     pub actual_amount: i128,
     pub exchange_rate_bps: u32,
 }
+
+// ─── Fraud detection (issue #437) ────────────────────────────────────────────
+
+/// What the contract does when a claim's fraud score meets or exceeds
+/// `FraudConfig.fraud_threshold_score`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FraudMode {
+    /// Reject the submission with `Error::FraudSuspected`. Default and safest:
+    /// no state is written for the flagged claim.
+    Block,
+    /// Persist a `FraudRecord` and emit `FraudFlagged`, then let the claim
+    /// enter the normal pending queue. Useful when the admin wants human
+    /// review to gate the claim later without blocking legitimate claimants.
+    FlagOnly,
+}
+
+/// Configuration for the additive rule-based fraud detector applied inside
+/// `submit_claim` and `batch_submit_claims`. Absent from storage means the
+/// detector is fully disabled and every claim proceeds unchecked, matching
+/// pre-issue-437 behaviour.
+///
+/// Rule scores default to values whose sum (90) is above the default
+/// `fraud_threshold_score` (50), so any single rule alone will not flag a
+/// claim but any two rules together will. Admins can rebalance freely.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FraudConfig {
+    /// Two claim submissions from the same claimant less than
+    /// `rate_window_secs` apart add `rate_score` to the second claim.
+    /// `0` disables the rule.
+    pub rate_window_secs: u64,
+    pub rate_score: u32,
+    /// The claimant's `burst_count`-th claim within `burst_window_secs` adds
+    /// `burst_score`. `0` in either window field disables the rule.
+    pub burst_window_secs: u64,
+    pub burst_count: u32,
+    pub burst_score: u32,
+    /// A claim whose `coverage_amount` exceeds
+    /// `coverage_anomaly_multiplier` * (claimant's rolling max prior
+    /// coverage_amount) adds `coverage_score`. `0` disables the rule.
+    pub coverage_anomaly_multiplier: u32,
+    pub coverage_score: u32,
+    /// Threshold at (or above) which the claim is treated as fraudulent
+    /// per `mode`. Capped at 100 by `set_fraud_config`.
+    pub fraud_threshold_score: u32,
+    pub mode: FraudMode,
+}
+
+/// Compact aggregate of a claimant's recent submission behaviour, kept as
+/// one storage entry per claimant instead of iterating every past claim on
+/// each new submission.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimantHistory {
+    /// Timestamp of the claimant's most recent successful submission.
+    /// `0` when the claimant has never submitted.
+    pub last_submission_at: u64,
+    /// Timestamp anchoring the current `burst_window` bucket. When
+    /// `now - burst_bucket_start > burst_window_secs` the bucket resets.
+    pub burst_bucket_start: u64,
+    /// Claims submitted inside the current burst bucket.
+    pub burst_count: u32,
+    /// Highest `coverage_amount` this claimant has ever submitted (across
+    /// all statuses; a rejected claim still shows the coverage they asked
+    /// for). Used by the coverage-anomaly rule.
+    pub max_coverage_ever: i128,
+    /// Total claims this claimant has ever submitted. Kept for observability
+    /// so admins can distinguish "new" from "veteran" claimants in dashboards.
+    pub total_submissions: u64,
+}
+
+/// A frozen snapshot of the fraud detector's judgement for one claim.
+/// Written only when the detector is configured and the score is nonzero
+/// so admins can post-hoc review flagged submissions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FraudRecord {
+    pub claim_id: u128,
+    pub score: u32,
+    /// Bitfield of rule contributions:
+    ///   bit 0 = rate rule
+    ///   bit 1 = burst rule
+    ///   bit 2 = coverage anomaly rule
+    pub flags: u32,
+    pub checked_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FraudConfigUpdated {
+    pub rate_window_secs: u64,
+    pub rate_score: u32,
+    pub burst_window_secs: u64,
+    pub burst_count: u32,
+    pub burst_score: u32,
+    pub coverage_anomaly_multiplier: u32,
+    pub coverage_score: u32,
+    pub fraud_threshold_score: u32,
+    pub mode: FraudMode,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FraudFlagged {
+    pub claim_id: u128,
+    pub claimant: Address,
+    pub score: u32,
+    pub flags: u32,
+    pub mode: FraudMode,
+}

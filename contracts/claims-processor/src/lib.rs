@@ -129,6 +129,16 @@ enum StorageKey {
     PayoutDelay,
     /// Identity attestation requirement: product_id → Symbol (id_type required).
     IdentityRequirement(u128),
+    /// Fraud detector configuration (issue #437). Absent = detector disabled
+    /// entirely; every claim proceeds unchecked.
+    FraudConfig,
+    /// Compact aggregate of a claimant's recent submission behaviour
+    /// (issue #437). Keyed by claimant so the fraud detector never has to
+    /// scan the full claim table on a new submission.
+    ClaimantHistory(Address),
+    /// A frozen snapshot of the fraud detector's judgement on one claim
+    /// (issue #437). Written only when the detector flagged something.
+    FraudRecord(u128),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -163,6 +173,10 @@ pub enum Error {
     /// Identity verification required for this claim category but not verified.
     IdentityVerificationRequired = 21,
     InvalidInput = 22,
+    /// Fraud detector flagged this claim's submission and the current
+    /// `FraudMode` is `Block` (issue #437). No state was written for the
+    /// rejected claim.
+    FraudSuspected = 23,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -196,6 +210,19 @@ const MIN_ESCALATION_THRESHOLD: u64 = 60 * 60;
 /// while still putting a firm upper bound on how long a claim can be filed
 /// after the event it relates to (issue #386).
 const DEFAULT_CLAIM_DEADLINE: u64 = 30 * 24 * 60 * 60;
+
+// ─── Fraud detection (issue #437) ────────────────────────────────────────────
+
+/// Ceiling for `FraudConfig.fraud_threshold_score`. Scores above 100 could
+/// never be reached because the three rules sum to at most 90, and even a
+/// future fourth rule should not push a single claim over 100.
+const MAX_FRAUD_SCORE: u32 = 100;
+
+/// Bitmask constants matching the `FraudRecord.flags` documentation. Kept
+/// as `u32` because the field is `u32`.
+const FRAUD_FLAG_RATE: u32 = 1 << 0;
+const FRAUD_FLAG_BURST: u32 = 1 << 1;
+const FRAUD_FLAG_COVERAGE: u32 = 1 << 2;
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
@@ -325,6 +352,15 @@ impl ClaimsProcessor {
         }
 
         let claim_id   = Self::next_claim_id(&env);
+
+        // Issue #437: score this submission against the configured fraud
+        // rules. In `Block` mode a high enough score panics here, before any
+        // claim state is written — the caller gets FraudSuspected and the
+        // world looks exactly as it did before the call. In `FlagOnly` mode
+        // a FraudRecord is persisted and the claim proceeds. When no config
+        // is set, this is a no-op.
+        Self::evaluate_fraud(&env, claim_id, &claimant, policy.coverage_amount);
+
         let claim = Claim {
             id: claim_id,
             policy_id,
@@ -359,9 +395,25 @@ impl ClaimsProcessor {
             ClaimSubmitted {
                 claim_id,
                 policy_id,
-                claimant,
+                claimant: claimant.clone(),
                 coverage_amount: policy.coverage_amount,
             },
+        );
+
+        // Issue #437: fold this submission into the claimant's aggregate
+        // history for the next call's fraud check. Only meaningful when the
+        // detector is on, but cheap enough to always maintain; keeping the
+        // aggregate up to date lets an admin turn the detector on later
+        // without every claimant looking like a first-time submitter.
+        let burst_window = Self::fraud_config(&env)
+            .map(|c| c.burst_window_secs)
+            .unwrap_or(0);
+        Self::update_claimant_history(
+            &env,
+            &claimant,
+            now,
+            policy.coverage_amount,
+            burst_window,
         );
 
         claim_id
@@ -1339,6 +1391,63 @@ impl ClaimsProcessor {
         Self::payout_delay(&env)
     }
 
+    /// Configure the fraud detector (issue #437). Admin-only. Absent
+    /// configuration means the detector is fully disabled; calling this
+    /// once with any `FraudConfig` turns it on for every subsequent
+    /// `submit_claim`.
+    ///
+    /// Bounds enforced:
+    /// - `fraud_threshold_score <= MAX_FRAUD_SCORE`
+    ///
+    /// Rule score fields are bounded implicitly by their `u32` type; a
+    /// pathological admin can still make a single rule fire the threshold
+    /// alone. That is intentional, so `Rule 3 alone = suspicious enough`
+    /// remains configurable.
+    pub fn set_fraud_config(env: Env, admin: Address, config: FraudConfig) {
+        Self::require_admin(&env, &admin);
+        if config.fraud_threshold_score > MAX_FRAUD_SCORE {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::FraudConfig, &config);
+        env.events().publish(
+            (Symbol::new(&env, "fraud_config_updated"),),
+            FraudConfigUpdated {
+                rate_window_secs: config.rate_window_secs,
+                rate_score: config.rate_score,
+                burst_window_secs: config.burst_window_secs,
+                burst_count: config.burst_count,
+                burst_score: config.burst_score,
+                coverage_anomaly_multiplier: config.coverage_anomaly_multiplier,
+                coverage_score: config.coverage_score,
+                fraud_threshold_score: config.fraud_threshold_score,
+                mode: config.mode,
+            },
+        );
+    }
+
+    /// The fraud detector configuration currently in force, or `None` when
+    /// the detector is disabled (issue #437).
+    pub fn get_fraud_config(env: Env) -> Option<FraudConfig> {
+        Self::fraud_config(&env)
+    }
+
+    /// The frozen fraud snapshot for a claim (issue #437). `None` when the
+    /// claim was never flagged (either the detector is off, the score was
+    /// below threshold, or the mode was Block and no state was written).
+    pub fn get_fraud_record(env: Env, claim_id: u128) -> Option<FraudRecord> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::FraudRecord(claim_id))
+    }
+
+    /// The claimant's aggregate history the detector uses. Returns the
+    /// empty aggregate when the claimant has never submitted (issue #437).
+    pub fn get_claimant_history(env: Env, claimant: Address) -> ClaimantHistory {
+        Self::claimant_history(&env, &claimant)
+    }
+
     /// The configured payout delay, or the default.
     fn payout_delay(env: &Env) -> u64 {
         env.storage()
@@ -1790,19 +1899,198 @@ impl ClaimsProcessor {
 
     fn validate_stellar_address(env: &Env, address: &Address) {
         let addr_str = address.to_string();
-        
+
         // Check length: Stellar public keys are exactly 56 characters
         if addr_str.len() != 56 {
             panic_with_error!(env, Error::InvalidAddress);
         }
-        
+
         let mut buf = [0u8; 56];
         addr_str.copy_into_slice(&mut buf);
-        
+
         // Check prefix: G (Stellar account) or C (Stellar contract)
         if buf[0] != b'G' && buf[0] != b'C' {
             panic_with_error!(env, Error::InvalidAddress);
         }
+    }
+
+    // ── Fraud detection helpers (issue #437) ──────────────────────────────
+
+    /// Fraud detector configuration if the admin has set one, else `None`.
+    /// `None` means the detector is disabled and every submission proceeds
+    /// unchecked (pre-issue-437 behaviour).
+    fn fraud_config(env: &Env) -> Option<FraudConfig> {
+        env.storage().instance().get(&StorageKey::FraudConfig)
+    }
+
+    /// A claimant's aggregate history, or an empty one for a first-time
+    /// submitter. `unwrap_or_else` ensures fresh submitters do not pay a
+    /// storage read that could fail.
+    fn claimant_history(env: &Env, claimant: &Address) -> ClaimantHistory {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::ClaimantHistory(claimant.clone()))
+            .unwrap_or(ClaimantHistory {
+                last_submission_at: 0,
+                burst_bucket_start: 0,
+                burst_count: 0,
+                max_coverage_ever: 0,
+                total_submissions: 0,
+            })
+    }
+
+    /// Score this submission against the configured rules. Returns
+    /// `(score, flags)`, both zero when the detector is disabled or when
+    /// no rule fires.
+    ///
+    /// Pure function over the passed-in `now` / `history` / `coverage` so it
+    /// can be tested without spinning up the full cross-contract world.
+    fn score_submission(
+        cfg: &FraudConfig,
+        now: u64,
+        history: &ClaimantHistory,
+        coverage_amount: i128,
+    ) -> (u32, u32) {
+        let mut score: u32 = 0;
+        let mut flags: u32 = 0;
+
+        // Rule 1: rapid resubmission. Only fires once a claimant has any
+        // prior submission on record; a first-ever claim never trips it.
+        if cfg.rate_window_secs > 0
+            && cfg.rate_score > 0
+            && history.last_submission_at > 0
+            && now.saturating_sub(history.last_submission_at) < cfg.rate_window_secs
+        {
+            score = score.saturating_add(cfg.rate_score);
+            flags |= FRAUD_FLAG_RATE;
+        }
+
+        // Rule 2: multi-policy burst. Fires when *this* submission would
+        // be the `burst_count`-th inside the active window bucket. The
+        // caller updates the bucket after admission; here we compute the
+        // hypothetical post-increment count using the stored bucket.
+        if cfg.burst_window_secs > 0 && cfg.burst_count > 0 && cfg.burst_score > 0 {
+            let bucket_alive = history.burst_bucket_start > 0
+                && now.saturating_sub(history.burst_bucket_start) < cfg.burst_window_secs;
+            let projected = if bucket_alive {
+                history.burst_count.saturating_add(1)
+            } else {
+                1
+            };
+            if projected >= cfg.burst_count {
+                score = score.saturating_add(cfg.burst_score);
+                flags |= FRAUD_FLAG_BURST;
+            }
+        }
+
+        // Rule 3: coverage anomaly. Requires prior coverage on record —
+        // a first-ever claim cannot be an anomaly relative to nothing.
+        if cfg.coverage_anomaly_multiplier > 0
+            && cfg.coverage_score > 0
+            && history.max_coverage_ever > 0
+        {
+            let threshold = history
+                .max_coverage_ever
+                .saturating_mul(cfg.coverage_anomaly_multiplier as i128);
+            if coverage_amount > threshold {
+                score = score.saturating_add(cfg.coverage_score);
+                flags |= FRAUD_FLAG_COVERAGE;
+            }
+        }
+
+        (score, flags)
+    }
+
+    /// Fold a just-admitted submission into the claimant's history. Bumps
+    /// `total_submissions` and `max_coverage_ever` on every call; resets or
+    /// extends the burst bucket based on how much time has passed since the
+    /// previous submission. Called by `submit_claim` after the fraud gate.
+    fn update_claimant_history(
+        env: &Env,
+        claimant: &Address,
+        now: u64,
+        coverage_amount: i128,
+        burst_window_secs: u64,
+    ) {
+        let prev = Self::claimant_history(env, claimant);
+        let (bucket_start, bucket_count) = if burst_window_secs == 0 {
+            // Feature effectively off — do not carry a stale bucket forward.
+            (0, 0)
+        } else if prev.burst_bucket_start == 0
+            || now.saturating_sub(prev.burst_bucket_start) >= burst_window_secs
+        {
+            (now, 1)
+        } else {
+            (prev.burst_bucket_start, prev.burst_count.saturating_add(1))
+        };
+
+        let next = ClaimantHistory {
+            last_submission_at: now,
+            burst_bucket_start: bucket_start,
+            burst_count: bucket_count,
+            max_coverage_ever: prev.max_coverage_ever.max(coverage_amount),
+            total_submissions: prev.total_submissions.saturating_add(1),
+        };
+        let key = StorageKey::ClaimantHistory(claimant.clone());
+        env.storage().persistent().set(&key, &next);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Run the configured fraud detector against a hypothetical submission.
+    /// If the detector is off (no `FraudConfig`) this returns immediately
+    /// with `(0, 0)` and does nothing else.
+    ///
+    /// If the score meets or exceeds the configured threshold and mode is
+    /// `Block`, the function panics with `FraudSuspected` after emitting
+    /// `FraudFlagged`. If mode is `FlagOnly`, it emits the event, persists a
+    /// `FraudRecord`, and returns so the caller can continue writing the
+    /// claim.
+    ///
+    /// Called from `submit_claim` after all existing gates so a rejection at
+    /// this point does not leak partial state.
+    fn evaluate_fraud(
+        env: &Env,
+        claim_id: u128,
+        claimant: &Address,
+        coverage_amount: i128,
+    ) -> (u32, u32) {
+        let Some(cfg) = Self::fraud_config(env) else {
+            return (0, 0);
+        };
+        let now = env.ledger().timestamp();
+        let history = Self::claimant_history(env, claimant);
+        let (score, flags) = Self::score_submission(&cfg, now, &history, coverage_amount);
+        if score >= cfg.fraud_threshold_score && cfg.fraud_threshold_score > 0 {
+            env.events().publish(
+                (Symbol::new(env, "fraud_flagged"),),
+                FraudFlagged {
+                    claim_id,
+                    claimant: claimant.clone(),
+                    score,
+                    flags,
+                    mode: cfg.mode.clone(),
+                },
+            );
+            match cfg.mode {
+                FraudMode::Block => panic_with_error!(env, Error::FraudSuspected),
+                FraudMode::FlagOnly => {
+                    let record = FraudRecord {
+                        claim_id,
+                        score,
+                        flags,
+                        checked_at: now,
+                    };
+                    let key = StorageKey::FraudRecord(claim_id);
+                    env.storage().persistent().set(&key, &record);
+                    env.storage()
+                        .persistent()
+                        .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+                }
+            }
+        }
+        (score, flags)
     }
 }
 
