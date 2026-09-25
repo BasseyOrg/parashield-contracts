@@ -251,6 +251,7 @@ impl ClaimsProcessor {
         env.storage().instance().set(&StorageKey::PendingClaims, &Vec::<u128>::new(&env));
         env.storage().instance().set(&StorageKey::Paused, &false);
         env.storage().instance().set(&StorageKey::ClaimDeadline, &DEFAULT_CLAIM_DEADLINE);
+        env.storage().instance().set(&StorageKey::EscalationThreshold, &DEFAULT_ESCALATION_THRESHOLD);
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),

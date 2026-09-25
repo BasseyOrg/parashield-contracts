@@ -1945,6 +1945,12 @@ impl OracleVerifier {
         key: Symbol,
         condition: TriggerCondition,
     ) -> bool {
+        // Reject evaluation when EncryptionRequired is enabled — plaintext
+        // DataPoints from before the flag was set must not be used (#463).
+        if Self::encryption_required(&env, &data_type) {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
         // Enforce minimum oracle participation before aggregation so a single
         // oracle cannot unilaterally determine the outcome.
         let min_count = Self::effective_min_oracle_count(&env, &data_type);
@@ -2129,6 +2135,15 @@ impl OracleVerifier {
 
     /// Return aggregated statistics across all oracle submissions for (data_type, key).
     pub fn get_aggregated(env: Env, data_type: Symbol, key: Symbol) -> AggregatedData {
+        // When EncryptionRequired is enabled for this data type, old plaintext
+        // submissions stored before the flag was set must not be included in
+        // aggregation — they would leak sensitive data alongside new encrypted
+        // submissions (#463). EncryptedDataPoints are ciphertext and cannot be
+        // aggregated on-chain, so this function has nothing to aggregate.
+        if Self::encryption_required(&env, &data_type) {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
         let points: Vec<OracleDataPoint> = env
             .storage()
             .persistent()
@@ -2252,6 +2267,13 @@ impl OracleVerifier {
         condition: TriggerCondition,
         max_age_seconds: u64,
     ) -> bool {
+        // Reject evaluation when EncryptionRequired is enabled — plaintext
+        // DataPoints from before the flag was set must not be used for
+        // trigger evaluation (#463).
+        if Self::encryption_required(&env, &data_type) {
+            panic_with_error!(&env, Error::NoDataAvailable);
+        }
+
         let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
         let points: Vec<OracleDataPoint> = env
             .storage()
