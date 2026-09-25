@@ -159,9 +159,13 @@ pub enum Error {
     /// Identity verification required for this claim category but not verified.
     IdentityVerificationRequired = 21,
     InvalidInput = 22,
+    /// Fraud detector flagged this claim's submission and the current
+    /// `FraudMode` is `Block` (issue #437). No state was written for the
+    /// rejected claim.
+    FraudSuspected = 23,
     /// An admin transfer was proposed while another one is still pending,
     /// which would reset the transfer timelock (issue #457).
-    AdminTransferPending = 23,
+    AdminTransferPending = 24,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
